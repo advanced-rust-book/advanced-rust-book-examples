@@ -1,0 +1,185 @@
+name: CI — build & run the code corpus
+
+# Buildability + runnability gate for every code listing the Docker Compose
+# stacks reference. Runs entirely on GitHub's default (CPU-only) runners.
+#
+#   * corpus/        — BUILD every listing and RUN the runnable ones, through the
+#                      docker-compose "runner" image (examples/exercises/solutions).
+#   * cuda-compile/  — the real-GPU listings (cuda/, onnx-gpu/) cannot RUN without
+#                      an NVIDIA GPU, so we still prove they COMPILE (cargo build,
+#                      no execution). cudarc/ort load their device libs at runtime,
+#                      so the build itself needs no GPU or CUDA toolkit.
+#   * compose/aux    — validate the four docker-compose files and the helper
+#                      listings (shell + python) that ship with the GPU stacks.
+#
+# Everything that can fan out runs in parallel.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer commit on the same ref supersedes an in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate the Docker Compose definitions themselves (the runner + 3 GPU stacks).
+  # ---------------------------------------------------------------------------
+  compose-validate:
+    name: validate compose files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose config (all stacks)
+        run: |
+          set -euo pipefail
+          for f in docker-compose.yml cuda/docker-compose.yml \
+                   onnx-gpu/docker-compose.yml ezkl-gpu/docker-compose.yml; do
+            echo "::group::docker compose -f $f config"
+            docker compose -f "$f" config -q
+            echo "OK: $f"
+            echo "::endgroup::"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Build the runner image ONCE; its layers are pushed to the Actions cache so the
+  # parallel corpus shards below reuse them instead of each rebuilding from scratch.
+  # ---------------------------------------------------------------------------
+  build-runner-image:
+    name: build runner image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build & cache advanced-rust-runner
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          tags: advanced-rust-runner:latest
+          cache-from: type=gha,scope=runner-image
+          cache-to: type=gha,mode=max,scope=runner-image
+
+  # ---------------------------------------------------------------------------
+  # BUILD + RUN the corpus. One parallel shard per tree:
+  #   examples/  solutions/ -> compile AND run (must exit 0)
+  #   exercises/            -> compile only (lab starters are incomplete by design;
+  #                            the two intentionally non-compiling ones are excused)
+  # GPU (cudarc/ort) and wasm-bindgen listings are skipped here by test_all.sh and
+  # are covered by cuda-compile below.
+  # ---------------------------------------------------------------------------
+  corpus:
+    name: corpus (${{ matrix.dir }})
+    needs: build-runner-image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [examples, exercises, solutions]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Load runner image from cache
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          tags: advanced-rust-runner:latest
+          load: true
+          cache-from: type=gha,scope=runner-image
+      - name: Build & run ${{ matrix.dir }}
+        run: bash docker/ci_check.sh ${{ matrix.dir }}
+
+  # ---------------------------------------------------------------------------
+  # Smoke-test the actual `docker compose run` path on a single representative file,
+  # so the documented one-liner in docker-compose.yml is exercised too (not only the
+  # batch driver).
+  # ---------------------------------------------------------------------------
+  compose-run-smoke:
+    name: compose run smoke test
+    needs: build-runner-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Load runner image from cache
+        uses: docker/build-push-action@v6
+        with:
+          context: ./docker
+          tags: advanced-rust-runner:latest
+          load: true
+          cache-from: type=gha,scope=runner-image
+      - name: docker compose run --rm runner <file>
+        run: |
+          set -euo pipefail
+          docker compose run --rm runner \
+            examples/ch10_arrays_slices_and_vectors/slice_first_api.rs
+
+  # ---------------------------------------------------------------------------
+  # CUDA / ONNX listings: prove they COMPILE on a CPU-only runner (no GPU, no run).
+  # cudarc (NVRTC, dynamic) and ort (load-dynamic) link nothing at build time, so a
+  # plain `cargo build` is a faithful compilability check. Running them needs a GPU
+  # (a self-hosted NVIDIA runner) and is intentionally out of scope here.
+  # ---------------------------------------------------------------------------
+  cuda-compile:
+    name: cuda compile-check (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [cuda, onnx-gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.project }}
+      - name: cargo build --release (compile only, no GPU)
+        working-directory: ${{ matrix.project }}
+        run: cargo build --release --verbose
+
+  # ---------------------------------------------------------------------------
+  # Cheap buildability check for the non-Rust helper listings that ship with the
+  # GPU stacks: the model-gen Python and the run shell scripts.
+  # ---------------------------------------------------------------------------
+  aux-listings:
+    name: aux listings (shell + python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every shell script
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' s; do
+            echo "checking $s"; bash -n "$s"
+          done < <(find . -name '*.sh' -print0)
+      - name: py_compile every python listing
+        run: |
+          set -euo pipefail
+          find . -name '*.py' -print0 | xargs -0 -r -n1 python3 -m py_compile
+
+  # ---------------------------------------------------------------------------
+  # Single required-status gate: green only if every job above succeeded.
+  # ---------------------------------------------------------------------------
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [compose-validate, corpus, compose-run-smoke, cuda-compile, aux-listings]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all jobs succeeded
+        run: |
+          echo "compose-validate : ${{ needs.compose-validate.result }}"
+          echo "corpus           : ${{ needs.corpus.result }}"
+          echo "compose-run-smoke: ${{ needs.compose-run-smoke.result }}"
+          echo "cuda-compile     : ${{ needs.cuda-compile.result }}"
+          echo "aux-listings     : ${{ needs.aux-listings.result }}"
+          [ "${{ needs.compose-validate.result }}" = "success" ] \
+            && [ "${{ needs.corpus.result }}" = "success" ] \
+            && [ "${{ needs.compose-run-smoke.result }}" = "success" ] \
+            && [ "${{ needs.cuda-compile.result }}" = "success" ] \
+            && [ "${{ needs.aux-listings.result }}" = "success" ]

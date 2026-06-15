@@ -1,0 +1,4 @@
+# Shell scripts run on Linux — in the runner image and on the CI runner — so they
+# must stay LF regardless of the contributor's platform / git autocrlf setting.
+# A CRLF checkout would make bash fail on the trailing '\r'.
+*.sh text eol=lf

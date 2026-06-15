@@ -8,7 +8,7 @@
 #     their runtime behaviour is not checked.
 #
 # Emits one TSV line per file on stdout:  <STATUS>\t<relpath>\t<base64 detail>
-# Statuses: PASS MISMATCH RAN_OK FAIL_BUILD_RUN STARTER_OK STARTER_NOCOMPILE SKIP_WASM
+# Statuses: PASS MISMATCH RAN_OK FAIL_BUILD_RUN STARTER_OK STARTER_NOCOMPILE SKIP_WASM SKIP_CUDA
 set -uo pipefail
 ROOT=/work
 EXP=/work/docker/_expected.tsv
